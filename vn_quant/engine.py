@@ -179,7 +179,7 @@ VN100 = ['FPT', 'VCB', 'HPG', 'TCB', 'ACB', 'BID', 'MWG', 'SSI', 'VND', 'CTD', '
                    'DSH', 'DDB', 'CLI', 'PIV', 'CLX', 'TTG', 'DVN', 'PXL', 'MPC', 'ABW', 'PGB', 'VBB', 'NCG', 'ALC', 'KCB',
                    'GCF', 'KLB', 'VAB', 'C32', 'CIG', 'HSL', 'RYG', 'VTO', 'HII', 'TCM', 'PPC', 'ELC', 'TCI', 'SHI', 'DAH',
                    'LDG', 'HQC', 'HHP', 'SCR', 'LCG', 'QCG', 'TTH', 'NRC', 'TVC', 'TIG', 'SVN', 'DL1', 'KIP', 'CTX', 'APF',
-                   'SBB', 'VNP', 'HVN', 'TLG', 'PET', 'VOS']
+                   'SBB', 'VNP', 'HVN']
 
 
 # Base weights — normalized về 100, regime sẽ điều chỉnh dynamic
@@ -4125,8 +4125,21 @@ def classify_strategies(rec: dict) -> dict:
     daily_watch = (score >= 5 or "✅" in str(rec.get("Tín hiệu", ""))) and not daily_exit
     s_daily = bucket(daily_buy, daily_watch, daily_exit)
 
+    smc = rec.get("S_SMC", "SKIP")
+    exits = sum(x == "EXIT" for x in (s_ichi, s_vsa, s_dg, s_daily))
+    buys = sum(x == "BUY" for x in (s_ichi, s_vsa, s_dg, s_daily))
+    # SMC không hô MUA nếu chưa có chiến thuật kia cùng mua, hoặc đang có lệnh bán.
+    if smc == "BUY" and (buys == 0 or exits >= 1):
+        smc = "WATCH"
+        rec["SMC nói"] = (
+            str(rec.get("SMC nói") or "")
+            + " Chưa vào lệnh: các chiến thuật kia chưa đồng ý mua (hoặc đang có tín hiệu bán)."
+        ).strip()
+        rec["SMC thesis"] = (str(rec.get("SMC thesis") or "") + " · Hạ WATCH để khỏi mua một mình.").strip()
+    rec["S_SMC"] = smc
+
     votes = {"BUY": 0, "WATCH": 0, "EXIT": 0, "SKIP": 0}
-    for s in (s_ichi, s_vsa, s_dg, s_daily, rec.get("S_SMC", "SKIP")):
+    for s in (s_ichi, s_vsa, s_dg, s_daily, smc):
         votes[s if s in votes else "SKIP"] += 1
 
     # Consensus: EXIT if >=2 EXIT; BUY if >=2 BUY and EXIT < 2; else WATCH if any interest
@@ -4148,7 +4161,7 @@ def classify_strategies(rec: dict) -> dict:
         "S_VSA": s_vsa,
         "S_RSI_DG": s_dg,
         "S_Daily": s_daily,
-        "S_SMC": rec.get("S_SMC", "SKIP"),
+        "S_SMC": smc,
         "votes_buy": votes["BUY"],
         "votes_watch": votes["WATCH"],
         "votes_exit": votes["EXIT"],
@@ -4184,7 +4197,7 @@ def scan_universe(
             if ohlc is not None:
                 try:
                     from vn_quant.smc import analyze_smc, plan_to_row
-                    plan = analyze_smc(ohlc)
+                    plan = analyze_smc(ohlc, flow_hint=rec)
                     if plan is not None:
                         rec.update(plan_to_row(plan))
                 except Exception as smc_e:
