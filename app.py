@@ -90,7 +90,7 @@ def show_df(df: pd.DataFrame, extra_cols=None):
         "S_Ichimoku", "S_VSA", "S_RSI_DG", "S_Daily", "S_SMC",
         "Tín hiệu", "Score", "Win%", "Giá", "VSA", "Ichimoku",
         "PK RSI (Composite)", "Cảnh báo DG", "Dòng tiền", "Trend",
-        "SMC bias", "SMC PD", "SMC POI", "SMC entry", "SMC SL", "SMC TP1", "SMC TP2", "SMC R:R",
+        "SMC bias", "SMC event", "SMC nói", "SMC PD", "SMC entry", "SMC SL", "SMC TP1", "SMC TP2", "SMC R:R",
         "Entry", "SL T+", "T+ T1", "T+ %", "T+ R:R",
         "Khuyến nghị Hold", "Action",
     ]
@@ -129,7 +129,7 @@ with st.sidebar:
     use_vsa = st.checkbox("VSA Smart Money (Grok)", True)
     use_dg = st.checkbox("RSI Divergence + Dao Găm", True)
     use_daily = st.checkbox("Daily BUY / WATCH / EXIT", True)
-    use_smc = st.checkbox("SMC (structure / OB / FVG)", True)
+    use_smc = st.checkbox("SMC khung lớn (phá đỉnh/đáy)", True)
 
     universe_choice = st.selectbox("Watchlist", ["Top thanh khoản (15 mã)", "VN100+", "Tự nhập"])
     custom = st.text_area("Danh sách mã (phẩy hoặc xuống dòng)", DEFAULT_WL, height=90)
@@ -320,8 +320,10 @@ with tab_x:
 
 with tab_smc:
     st.caption(
-        "SMC đúng nghĩa, long-only (sàn VN không short): swing → BOS/CHoCH → demand OB/FVG. "
-        "Bias giảm = EXIT/WATCH, không đặt entry trên giá hay TP dưới giá."
+        "SMC khung ngày/tuần/tháng: chỉ tính đỉnh đáy lớn. "
+        "Phá đáy hoặc đảo đỉnh → không mua / bán nếu đang cầm. "
+        "Đảo đáy hoặc phá đỉnh → chỉ mua khi giá còn gần đáy và có dòng tiền hoặc test đáy thành công. "
+        "Nếu SMC muốn mua mà từ 2 chiến thuật kia bảo bán, SMC bị hạ xuống chờ."
     )
     if work.empty:
         st.info("Chạy scan trước.")
@@ -348,8 +350,9 @@ with tab_smc:
                 st.plotly_chart(smc_plotly(ohlc, plan, title=f"{pick_smc} · {plan.structure}"), width="stretch")
                 left, right = st.columns(2)
                 with left:
-                    st.markdown("**Nhận định**")
-                    st.write(plan.thesis)
+                    st.markdown("**Nên làm gì**")
+                    st.write(plan.plain)
+                    st.caption(plan.tf_label)
                     if plan.has_long_setup:
                         lv = (
                             f"- POI: {plan.poi_label}\n"
@@ -410,7 +413,8 @@ with tab_d:
             }
         )
         st.markdown(
-            f"**SMC:** {row.get('SMC bias','—')} · {row.get('SMC PD','—')} · {row.get('SMC POI','—')}  \n"
+            f"**SMC:** {row.get('SMC event','—')} · {row.get('SMC nói','—')}  \n"
+            f"Khung lớn: {row.get('SMC TF','—')}  \n"
             f"Entry {row.get('SMC entry','—')} · SL {row.get('SMC SL','—')} · "
             f"TP1 {row.get('SMC TP1','—')} / TP2 {row.get('SMC TP2','—')} · {row.get('SMC R:R','—')}"
         )
