@@ -1,16 +1,18 @@
-"""Smart Money Concepts on daily VN OHLCV.
+"""SMC khung lớn cho cổ phiếu VN (chỉ long).
 
-Implements the ICT / SMC stack used for cash equities (no session killzones):
-  - swing structure → BOS / CHoCH
-  - dealing range, premium / discount / EQ
-  - unmitigated order blocks
-  - 3-candle FVG
-  - swing + equal-highs/lows liquidity
-  - POI confluence → entry zone, SL, TP1/TP2
+Không đọc sóng 3 nến. Zigzag tối thiểu ~6–10% (và khung tuần/tháng) giống
+các chart Super SMC: đỉnh/đáy lớn, BOS, CHoCH, Fibonacci 0–1 của nhịp vừa rồi.
+
+Khuyến nghị viết tiếng thường:
+  - Phá đỉnh (BOS lên)  → trend tăng còn, đừng đuổi, chờ hồi 50–78.6%.
+  - Phá đáy (BOS xuống) → giảm chưa xong, không mua, đang cầm thì bán.
+  - Đảo đáy (CHoCH lên) → đáy có thể xong; chỉ mua nếu còn gần đáy và có dòng tiền
+    hoặc test đáy thành công.
+  - Đảo đỉnh (CHoCH xuống) → đỉnh có thể xong, không mua, đang cầm thì bán.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field
 from typing import Literal, Optional
 
 import numpy as np
@@ -19,53 +21,51 @@ import pandas as pd
 Bias = Literal["bull", "bear", "range"]
 Action = Literal["BUY", "WATCH", "EXIT", "SKIP"]
 
+FIB_RATIOS = (0.0, 0.236, 0.382, 0.5, 0.618, 0.786, 1.0)
 
-def _atr(df: pd.DataFrame, n: int = 14) -> pd.Series:
+
+def _atr(df: pd.DataFrame, n: int = 14) -> float:
     h, l, c = df["high"], df["low"], df["close"]
     prev = c.shift(1)
     tr = pd.concat([(h - l).abs(), (h - prev).abs(), (l - prev).abs()], axis=1).max(axis=1)
-    return tr.rolling(n, min_periods=n).mean()
+    v = tr.rolling(n, min_periods=max(5, n // 2)).mean().iloc[-1]
+    if pd.isna(v) or v <= 0:
+        return float(c.iloc[-1] * 0.02)
+    return float(v)
 
 
-def find_swings(df: pd.DataFrame, left: int = 3, right: int = 3) -> pd.DataFrame:
-    """Confirmed fractal swings. A pivot at i is only known at i+right."""
-    n = len(df)
-    highs = df["high"].to_numpy(float)
-    lows = df["low"].to_numpy(float)
-    sh = np.zeros(n, dtype=bool)
-    sl = np.zeros(n, dtype=bool)
-    for i in range(left, n - right):
-        w_h = highs[i - left : i + right + 1]
-        w_l = lows[i - left : i + right + 1]
-        if highs[i] >= w_h.max() and (w_h == highs[i]).sum() == 1:
-            sh[i] = True
-        if lows[i] <= w_l.min() and (w_l == lows[i]).sum() == 1:
-            sl[i] = True
-    out = df[["time", "open", "high", "low", "close"]].copy()
-    out["swing_high"] = sh
-    out["swing_low"] = sl
-    return out
+def _resample(df: pd.DataFrame, freq: str) -> pd.DataFrame:
+    x = df.copy()
+    x["time"] = pd.to_datetime(x["time"])
+    x = x.set_index("time").sort_index()
+    o = (
+        x.resample(freq)
+        .agg(open=("open", "first"), high=("high", "max"), low=("low", "min"), close=("close", "last"), volume=("volume", "sum"))
+        .dropna(subset=["close"])
+        .reset_index()
+    )
+    return o
 
 
 @dataclass
 class Swing:
     i: int
     price: float
-    kind: str  # "H" | "L"
+    kind: str  # H | L
     time: object
 
 
 @dataclass
 class Event:
     i: int
-    kind: str  # BOS_UP / BOS_DN / CHOCH_UP / CHOCH_DN
+    kind: str  # BOS_UP BOS_DN CHOCH_UP CHOCH_DN
     price: float
     time: object
 
 
 @dataclass
 class Zone:
-    kind: str  # BULL_OB / BEAR_OB / BULL_FVG / BEAR_FVG
+    kind: str
     i0: int
     i1: int
     low: float
@@ -87,8 +87,8 @@ class SmcPlan:
     dealing_low: float
     dealing_high: float
     eq: float
-    pd: str  # PREMIUM / DISCOUNT / EQ
-    pd_pct: float  # 0 = discount extreme, 1 = premium extreme
+    pd: str
+    pd_pct: float
     poi: Optional[Zone]
     poi_label: str
     entry_low: float
@@ -105,25 +105,51 @@ class SmcPlan:
     events: list
     zones: list
     swings: list
-    has_long_setup: bool = True
+    has_long_setup: bool = False
     invalidation: float = 0.0
+    plain: str = ""
+    tf_label: str = ""
+    fibs: list = field(default_factory=list)  # (ratio, price)
 
 
-def _alternating_swings(df: pd.DataFrame) -> list[Swing]:
-    rows = []
-    for i, r in df.iterrows():
-        if r["swing_high"]:
-            rows.append(Swing(int(i), float(r["high"]), "H", r["time"]))
-        if r["swing_low"]:
-            rows.append(Swing(int(i), float(r["low"]), "L", r["time"]))
-    rows.sort(key=lambda s: s.i)
+def major_zigzag(df: pd.DataFrame, min_pct: float) -> list[Swing]:
+    """Đỉnh/đáy chỉ khi giá đảo chiều ít nhất min_pct. Bỏ nhiễu vài phiên."""
+    if df is None or len(df) < 10:
+        return []
+    hi = df["high"].to_numpy(float)
+    lo = df["low"].to_numpy(float)
+    times = df["time"].tolist()
+    n = len(df)
+    pivots: list[Swing] = []
+    # seed
+    direction = 1 if hi[5] >= hi[0] else -1
+    ext_i, ext_p = 0, hi[0] if direction == 1 else lo[0]
+    for i in range(1, n):
+        if direction == 1:
+            if hi[i] >= ext_p:
+                ext_p, ext_i = hi[i], i
+            elif ext_p > 0 and (ext_p - lo[i]) / ext_p >= min_pct:
+                pivots.append(Swing(ext_i, float(ext_p), "H", times[ext_i]))
+                direction = -1
+                ext_p, ext_i = lo[i], i
+        else:
+            if lo[i] <= ext_p:
+                ext_p, ext_i = lo[i], i
+            elif ext_p > 0 and (hi[i] - ext_p) / ext_p >= min_pct:
+                pivots.append(Swing(ext_i, float(ext_p), "L", times[ext_i]))
+                direction = 1
+                ext_p, ext_i = hi[i], i
+    # extreme đang chạy (chưa đảo đủ %) vẫn là đỉnh/đáy tạm để đo fib
+    kind = "H" if direction == 1 else "L"
+    if not pivots or pivots[-1].i != ext_i:
+        pivots.append(Swing(ext_i, float(ext_p), kind, times[ext_i]))
+    # bỏ đỉnh/đáy trùng loại liên tiếp — giữ cực trị
     alt: list[Swing] = []
-    for s in rows:
+    for s in pivots:
         if not alt:
             alt.append(s)
             continue
         if s.kind == alt[-1].kind:
-            # keep more extreme
             if s.kind == "H" and s.price >= alt[-1].price:
                 alt[-1] = s
             elif s.kind == "L" and s.price <= alt[-1].price:
@@ -133,431 +159,434 @@ def _alternating_swings(df: pd.DataFrame) -> list[Swing]:
     return alt
 
 
-def _structure_events(df: pd.DataFrame, swings: list[Swing]) -> tuple[list[Event], Bias, str]:
+def _space_swings(swings: list[Swing], min_bars: int, min_pct: float) -> list[Swing]:
+    """Gộp pivot quá gần — chart mẫu chỉ nối đỉnh/đáy cách nhau nhiều phiên."""
+    out: list[Swing] = []
+    for s in swings:
+        if not out:
+            out.append(s)
+            continue
+        if s.i - out[-1].i < min_bars:
+            move = abs(s.price - out[-1].price) / max(out[-1].price, 1e-9)
+            if s.kind == out[-1].kind:
+                if (s.kind == "H" and s.price >= out[-1].price) or (s.kind == "L" and s.price <= out[-1].price):
+                    out[-1] = s
+                continue
+            if move < min_pct:
+                continue
+        if s.kind == out[-1].kind:
+            if s.kind == "H" and s.price >= out[-1].price:
+                out[-1] = s
+            elif s.kind == "L" and s.price <= out[-1].price:
+                out[-1] = s
+            continue
+        out.append(s)
+    return out
+
+
+def _events_from_swings(df: pd.DataFrame, swings: list[Swing]) -> tuple[list[Event], Bias]:
+    """BOS = phá cùng chiều trend. CHoCH = phá ngược chiều (đảo)."""
     events: list[Event] = []
     if len(swings) < 3:
-        return events, "range", "Chưa đủ swing để đọc structure"
-
-    last_h = next((s for s in reversed(swings) if s.kind == "H"), None)
-    last_l = next((s for s in reversed(swings) if s.kind == "L"), None)
-    # seed bias from last two opposite swings vs previous same kind
-    hs = [s for s in swings if s.kind == "H"]
-    ls = [s for s in swings if s.kind == "L"]
-    bias: Bias = "range"
-    if len(hs) >= 2 and len(ls) >= 2:
-        if hs[-1].price > hs[-2].price and ls[-1].price > ls[-2].price:
-            bias = "bull"
-        elif hs[-1].price < hs[-2].price and ls[-1].price < ls[-2].price:
-            bias = "bear"
-
+        return events, "range"
     close = df["close"].to_numpy(float)
     times = df["time"].tolist()
-    # Walk bars after each swing; detect close beyond last opposite swing
-    confirmed_h = None
-    confirmed_l = None
-    trend: Bias = bias if bias != "range" else "range"
+    trend: Bias = "range"
+    last_h = None
+    last_l = None
     for s in swings:
         if s.kind == "H":
-            confirmed_h = s
+            prev = last_h
+            last_h = s
+            if prev is None:
+                continue
+            # tìm phiên đóng cửa vượt đỉnh cũ, sau đỉnh cũ và trước/đến đỉnh mới
+            for j in range(prev.i + 1, min(len(df), s.i + 1)):
+                if close[j] > prev.price:
+                    kind = "BOS_UP" if trend == "bull" else "CHOCH_UP"
+                    events.append(Event(j, kind, float(prev.price), times[j]))
+                    trend = "bull"
+                    break
         else:
-            confirmed_l = s
-        if confirmed_h is None or confirmed_l is None:
-            continue
-        start = s.i + 1
-        end = min(len(df), start + 40)
-        for j in range(start, end):
-            if trend in ("bull", "range") and close[j] > confirmed_h.price:
-                kind = "BOS_UP" if trend == "bull" else "CHOCH_UP"
-                events.append(Event(j, kind, float(confirmed_h.price), times[j]))
-                trend = "bull"
-                break
-            if trend in ("bear", "range") and close[j] < confirmed_l.price:
-                kind = "BOS_DN" if trend == "bear" else "CHOCH_DN"
-                events.append(Event(j, kind, float(confirmed_l.price), times[j]))
-                trend = "bear"
-                break
-
-    # collapse consecutive same-kind events (keep last)
+            prev = last_l
+            last_l = s
+            if prev is None:
+                continue
+            for j in range(prev.i + 1, min(len(df), s.i + 1)):
+                if close[j] < prev.price:
+                    kind = "BOS_DN" if trend == "bear" else "CHOCH_DN"
+                    events.append(Event(j, kind, float(prev.price), times[j]))
+                    trend = "bear"
+                    break
     compact: list[Event] = []
     for e in events:
-        if compact and compact[-1].kind == e.kind:
+        if compact and compact[-1].kind == e.kind and abs(e.i - compact[-1].i) < 8:
             compact[-1] = e
         else:
             compact.append(e)
-    last = compact[-1].kind if compact else "NONE"
-    if last.endswith("UP"):
-        trend = "bull"
-    elif last.endswith("DN"):
-        trend = "bear"
+    if compact:
+        last = compact[-1].kind
+        trend = "bull" if last.endswith("UP") else "bear"
+    return compact, trend
+
+
+def _tf_note(df: pd.DataFrame, freq: str, min_pct: float, name: str) -> str:
+    try:
+        w = _resample(df, freq)
+    except Exception:
+        return f"{name}: —"
+    if len(w) < 8:
+        return f"{name}: ít nến"
+    sw = major_zigzag(w, min_pct)
+    ev, bias = _events_from_swings(w, sw)
+    bias_vi = {"bull": "tăng", "bear": "giảm", "range": "đi ngang"}.get(bias, "—")
+    if not ev:
+        return f"{name}: {bias_vi}"
+    last = ev[-1]
+    fresh = last.i >= len(w) - 6
     label = {
-        "bull": "HH / HL — xu hướng tăng (SMT bullish)",
-        "bear": "LH / LL — xu hướng giảm (SMT bearish)",
-        "range": "Range — chưa CHoCH rõ",
-    }[trend]
-    return compact, trend, label
+        "BOS_UP": "phá đỉnh",
+        "BOS_DN": "phá đáy",
+        "CHOCH_UP": "đảo đáy",
+        "CHOCH_DN": "đảo đỉnh",
+    }.get(last.kind, last.kind)
+    age = "mới" if fresh else "cũ"
+    return f"{name}: {bias_vi}, {label} ({age})"
 
 
-def _order_blocks(df: pd.DataFrame, events: list[Event]) -> list[Zone]:
-    """Last opposing candle before a displacement event."""
-    zones: list[Zone] = []
-    o = df["open"].to_numpy(float)
-    h = df["high"].to_numpy(float)
-    l = df["low"].to_numpy(float)
+def _flow_and_retest(df: pd.DataFrame, major_low: float, hint: Optional[dict]) -> tuple[bool, bool, str]:
+    """Dòng tiền vào, hoặc test đáy lớn rồi giữ được."""
     c = df["close"].to_numpy(float)
-    times = df["time"].tolist()
-    for e in events:
-        bull = e.kind.endswith("UP")
-        # search back up to 8 bars for last opposite candle
-        found = None
-        for k in range(e.i - 1, max(-1, e.i - 9), -1):
-            bearish = c[k] < o[k]
-            bullish = c[k] > o[k]
-            if bull and bearish:
-                found = k
-                break
-            if (not bull) and bullish:
-                found = k
-                break
-        if found is None:
-            continue
-        z = Zone(
-            kind="BULL_OB" if bull else "BEAR_OB",
-            i0=found,
-            i1=found,
-            low=float(l[found]),
-            high=float(h[found]),
-            time0=times[found],
-            time1=times[found],
-        )
-        # mitigated if later wick trades through 50%
-        mid = z.mid
-        after = slice(e.i + 1, None)
-        if bull:
-            z.mitigated = bool((l[after] <= mid).any()) if e.i + 1 < len(df) else False
-        else:
-            z.mitigated = bool((h[after] >= mid).any()) if e.i + 1 < len(df) else False
-        zones.append(z)
-    return zones
+    o = df["open"].to_numpy(float)
+    v = df["volume"].to_numpy(float)
+    lo = df["low"].to_numpy(float)
+    tail = slice(-6, None)
+    up = float(v[tail][c[tail] >= o[tail]].sum()) if len(c) >= 6 else 0.0
+    dn = float(v[tail][c[tail] < o[tail]].sum()) if len(c) >= 6 else 0.0
+    price_up = c[-1] >= c[-6] if len(c) >= 6 else False
+    flow = up > dn * 1.1 and price_up
+    why = []
+    if flow:
+        why.append("khối lượng nghiêng mua 6 phiên")
+    if hint:
+        try:
+            cmf = float(str(hint.get("CMF", "0")).replace(",", ""))
+        except ValueError:
+            cmf = 0.0
+        vsa = str(hint.get("VSA", "") or "")
+        vol_s = str(hint.get("Vol", "") or "").lower().replace("x", "")
+        try:
+            vr = float(vol_s) if vol_s else 0.0
+        except ValueError:
+            vr = 0.0
+        if cmf > 0.02:
+            flow = True
+            why.append(f"CMF {cmf:.2f} dương")
+        if any(k in vsa for k in ("NỔ VOL", "RÚT CHÂN", "CẠN VOL")):
+            flow = True
+            why.append(f"VSA {vsa}")
+        if vr >= 1.3 and price_up:
+            flow = True
+            why.append(f"vol {vr:.1f}x")
+        if "PHÂN PHỐI" in vsa or "CẠN CẦU" in vsa:
+            flow = False
+            why.append("VSA phân phối/cạn cầu — bỏ dòng tiền")
+    # test đáy: 15 phiên chạm sát đáy lớn nhưng đóng cửa vẫn trên đáy
+    window_lo = lo[-15:] if len(lo) >= 15 else lo
+    window_c = c[-15:] if len(c) >= 15 else c
+    touched = float(window_lo.min()) <= major_low * 1.03
+    held = float(window_c[-1]) >= major_low * 0.995 and float(window_c.min()) >= major_low * 0.97
+    retest = bool(touched and held)
+    if retest:
+        why.append("test đáy lớn rồi giữ được (không đóng cửa thủng)")
+    return flow, retest, ", ".join(why) if why else "chưa có dòng tiền"
 
 
-def _fvgs(df: pd.DataFrame) -> list[Zone]:
-    h = df["high"].to_numpy(float)
-    l = df["low"].to_numpy(float)
-    times = df["time"].tolist()
-    n = len(df)
-    out: list[Zone] = []
-    for i in range(1, n - 1):
-        # bullish FVG: gap between high[i-1] and low[i+1]
-        if l[i + 1] > h[i - 1]:
-            z = Zone("BULL_FVG", i - 1, i + 1, float(h[i - 1]), float(l[i + 1]), times[i - 1], times[i + 1])
-            # fill if later low goes into gap
-            filled = bool((l[i + 2 :] <= z.high).any()) if i + 2 < n else False
-            # full mitigate if low <= gap low
-            full = bool((l[i + 2 :] <= z.low).any()) if i + 2 < n else False
-            z.mitigated = full
-            if not full:
-                out.append(z)
-        elif h[i + 1] < l[i - 1]:
-            z = Zone("BEAR_FVG", i - 1, i + 1, float(h[i + 1]), float(l[i - 1]), times[i - 1], times[i + 1])
-            full = bool((h[i + 2 :] >= z.high).any()) if i + 2 < n else False
-            z.mitigated = full
-            if not full:
-                out.append(z)
-    return out[-12:]
+def _fib_prices(top: float, bot: float) -> list[tuple[float, float]]:
+    span = top - bot
+    return [(r, top - span * r) for r in FIB_RATIOS]
 
 
-def _equal_levels(swings: list[Swing], atr: float, kind: str) -> list[float]:
-    pts = [s.price for s in swings if s.kind == kind]
-    if len(pts) < 2:
-        return []
-    tol = max(atr * 0.25, 0.003 * np.median(pts))
-    used = [False] * len(pts)
-    levels = []
-    for i in range(len(pts)):
-        if used[i]:
-            continue
-        cluster = [pts[i]]
-        used[i] = True
-        for j in range(i + 1, len(pts)):
-            if abs(pts[j] - pts[i]) <= tol:
-                cluster.append(pts[j])
-                used[j] = True
-        if len(cluster) >= 2:
-            levels.append(float(np.mean(cluster)))
-    return levels[-4:]
+def _plain(kind: str) -> str:
+    return {
+        "BOS_UP": "Phá đỉnh (BOS): giá vượt đỉnh lớn cũ — xu hướng tăng còn sống. Đừng mua đuổi. Chờ hồi về khoảng 50–78.6% của nhịp tăng.",
+        "BOS_DN": "Phá đáy (BOS): giá thủng đáy lớn cũ — đà giảm chưa xong. Không mua. Nếu đang cầm thì bán.",
+        "CHOCH_UP": "Đảo đáy (CHoCH): giá phá đỉnh của nhịp giảm — đáy lớn có thể đã hình thành. Chỉ mua nếu giá còn sát đáy và có dòng tiền hoặc test đáy thành công.",
+        "CHOCH_DN": "Đảo đỉnh (CHoCH): giá thủng đáy của nhịp tăng — đỉnh lớn có thể đã hình thành. Không mua mới. Nếu đang cầm thì bán.",
+        "NONE": "Chưa có phá đỉnh/đáy lớn mới. Đứng ngoài, chỉ canh vùng gần đáy khung ngày/tuần.",
+    }.get(kind, kind)
 
 
-def _pick_long_poi(obs: list[Zone], fvgs: list[Zone], close: float) -> Optional[Zone]:
-    """Chỉ lấy demand (bullish OB / FVG) nằm dưới hoặc sát giá — thị trường VN long-only."""
-    cands = [z for z in obs + fvgs if z.kind in ("BULL_OB", "BULL_FVG") and not z.mitigated]
-    if not cands:
-        return None
-    ranked = []
-    for z in cands:
-        below = z.high <= close * 1.012
-        dist = close - z.mid
-        score = 2.5 if "OB" in z.kind else 0.0
-        if below and dist >= 0:
-            score += 4
-            score -= min(dist / max(close, 1) * 20, 3)  # gần giá hơn thì tốt hơn, miễn còn dưới
-        else:
-            score -= 6  # FVG đã chạy trên đầu — không đuổi
-        ranked.append((score, z))
-    ranked.sort(key=lambda x: x[0], reverse=True)
-    best_s, best = ranked[0]
-    return best if best_s > 0 else None
-
-
-def _long_sl(entry_low: float, dealing_low: float, close: float, atr: float) -> float:
-    buf = max(atr * 0.35, close * 0.004)
-    sl = min(entry_low, dealing_low) - buf
-    cap = min(entry_low, close) - buf
-    if sl >= cap:
-        sl = cap
-    return float(sl)
-
-
-def _long_targets(close: float, entry_mid: float, liq_up: list, dealing_high: float, atr: float) -> tuple[float, float]:
-    """TP luôn phía trên giá hiện tại và trên entry — không bao giờ target short."""
-    floor = max(close, entry_mid) * 1.005
-    above = sorted(x for x in liq_up if x > floor)
-    tp1 = above[0] if above else floor + max(atr * 1.2, floor * 0.03)
-    tp2 = above[1] if len(above) > 1 else max(dealing_high, tp1 + max(atr, floor * 0.03))
-    if tp2 <= tp1:
-        tp2 = tp1 + max(atr, floor * 0.03)
-    if tp1 <= close:
-        tp1 = close + max(atr * 1.2, close * 0.03)
-    if tp2 <= tp1:
-        tp2 = tp1 + max(atr, close * 0.03)
-    return float(tp1), float(tp2)
-
-
-def analyze_smc(df: pd.DataFrame, swing_n: int = 3) -> Optional[SmcPlan]:
+def analyze_smc(df: pd.DataFrame, swing_n: int = 3, flow_hint: Optional[dict] = None) -> Optional[SmcPlan]:
+    del swing_n  # giữ signature cũ; sóng lớn không dùng fractal 3
     if df is None or len(df) < 40:
         return None
     work = df.reset_index(drop=True).copy()
     for col in ("open", "high", "low", "close"):
         work[col] = pd.to_numeric(work[col], errors="coerce")
+    if "volume" not in work.columns:
+        work["volume"] = 0.0
+    work["volume"] = pd.to_numeric(work["volume"], errors="coerce").fillna(0)
     work = work.dropna(subset=["open", "high", "low", "close"])
     if "time" not in work.columns:
         work["time"] = np.arange(len(work))
-    atr = float(_atr(work).iloc[-1] or work["close"].iloc[-1] * 0.02)
-    sw = find_swings(work, swing_n, swing_n)
-    swings = _alternating_swings(sw)
-    events, bias, structure = _structure_events(work, swings)
-    obs = _order_blocks(work, events)
-    fvgs = _fvgs(work)
+    if len(work) < 40:
+        return None
+
+    atr = _atr(work)
+    close = float(work["close"].iloc[-1])
+    atr_pct = atr / max(close, 1e-9)
+    # Sàn VN: chỉ lấy nhịp đảo chiều khoảng 12% trở lên — bỏ sóng vài phiên.
+    min_pct = float(np.clip(max(0.12, atr_pct * 4.0), 0.12, 0.18))
+    swings = major_zigzag(work, min_pct)
+    swings = _space_swings(swings, min_bars=10, min_pct=min_pct)
+    if len(swings) < 4:
+        swings = _space_swings(major_zigzag(work, 0.08), min_bars=8, min_pct=0.08)
+    events, bias = _events_from_swings(work, swings)
+    last_event = events[-1].kind if events else "NONE"
+    fresh = bool(events) and events[-1].i >= len(work) - 25
+    # Phá rồi lấy lại: không còn tính là phá đáy/đảo đỉnh.
+    if fresh and last_event in ("BOS_DN", "CHOCH_DN") and close > events[-1].price * 1.015:
+        fresh = False
+    if fresh and last_event in ("BOS_UP", "CHOCH_UP") and close < events[-1].price * 0.985:
+        fresh = False
 
     hs = [s for s in swings if s.kind == "H"]
     ls = [s for s in swings if s.kind == "L"]
-    dealing_high = float(max(hs[-1].price, work["high"].iloc[-1])) if hs else float(work["high"].tail(40).max())
-    dealing_low = float(min(ls[-1].price, work["low"].iloc[-1])) if ls else float(work["low"].tail(40).min())
-    # range của 2 swing gần nhất cùng chiều structure
-    if len(hs) and len(ls):
-        dealing_high = float(max(hs[-1].price, work["high"].tail(5).max()))
-        dealing_low = float(min(ls[-1].price, work["low"].tail(5).min()))
-    if dealing_high <= dealing_low:
-        dealing_high = float(work["high"].tail(40).max())
-        dealing_low = float(work["low"].tail(40).min())
-    eq = (dealing_high + dealing_low) / 2.0
-    close = float(work["close"].iloc[-1])
-    span = max(dealing_high - dealing_low, 1e-9)
-    pd_pct = float(np.clip((close - dealing_low) / span, 0, 1))
-    if pd_pct >= 0.55:
-        pd_zone = "PREMIUM"
-    elif pd_pct <= 0.45:
-        pd_zone = "DISCOUNT"
+    if not hs or not ls:
+        return None
+
+    # Nhịp fib = 2 swing đối diện gần nhất (đỉnh ↔ đáy), giống thước fib trên chart mẫu
+    a, b = swings[-2], swings[-1]
+    leg_top = max(a.price, b.price)
+    leg_bot = min(a.price, b.price)
+    if leg_top <= leg_bot:
+        leg_top = float(work["high"].tail(60).max())
+        leg_bot = float(work["low"].tail(60).min())
+    span = max(leg_top - leg_bot, 1e-9)
+    fibs = _fib_prices(leg_top, leg_bot)
+    fib_map = {r: p for r, p in fibs}
+    # 0 = đỉnh nhịp, 1 = đáy nhịp. depth 0 ở đỉnh, 1 ở đáy
+    depth = float(np.clip((leg_top - close) / span, 0, 1))
+    eq = fib_map[0.5]
+    if depth >= 0.55:
+        pd_zone = "DISCOUNT"  # gần đáy nhịp
+    elif depth <= 0.45:
+        pd_zone = "PREMIUM"  # gần đỉnh nhịp
     else:
         pd_zone = "EQ"
 
-    liq_up = _equal_levels(swings, atr, "H")
-    liq_dn = _equal_levels(swings, atr, "L")
-    if hs:
-        liq_up.append(hs[-1].price)
-    if ls:
-        liq_dn.append(ls[-1].price)
-    liq_up = sorted(set(round(x, 2) for x in liq_up), reverse=True)[:4]
-    liq_dn = sorted(set(round(x, 2) for x in liq_dn))[:4]
+    major_low = float(ls[-1].price)
+    major_high = float(hs[-1].price)
+    flow, retest, flow_why = _flow_and_retest(work, major_low, flow_hint)
+    near_low = depth >= 0.62 or close <= major_low * 1.06
+    in_golden = 0.50 <= depth <= 0.86  # hồi về 50–78.6% (và sâu hơn một chút)
 
-    last_event = events[-1].kind if events else "NONE"
-    poi = _pick_long_poi(obs, fvgs, close)
-    last_swing_low = float(ls[-1].price) if ls else float(work["low"].tail(20).min())
-    invalidation = last_swing_low
-    if invalidation >= close:
-        invalidation = float(work["low"].tail(8).min())
-    if invalidation >= close:
-        invalidation = close - max(atr * 0.35, close * 0.004)
+    week = _tf_note(work, "W-FRI", max(0.08, min_pct), "Tuần")
+    month = _tf_note(work, "ME", 0.12, "Tháng")
+    tf_label = f"{week} · {month}"
+    higher_tf_blocking = ("phá đáy (mới)" in week) or ("đảo đỉnh (mới)" in week) or ("phá đáy (mới)" in month)
 
-    poi_names = {
-        "BULL_OB": "Bullish Order Block (demand — nến giảm cuối trước đẩy lên)",
-        "BULL_FVG": "Bullish FVG / imbalance (demand)",
-        "BEAR_OB": "Bearish Order Block",
-        "BEAR_FVG": "Bearish FVG",
-    }
+    # vùng mua gần đáy nhịp: từ đáy đến fib 0.618 (tức depth 1.0 → 0.618)
+    zone_low = fib_map[1.0]
+    zone_high = fib_map[0.618]
+    if zone_high < zone_low:
+        zone_low, zone_high = zone_high, zone_low
+    demand = Zone(
+        "BULL_OB",
+        i0=int(ls[-1].i),
+        i1=int(ls[-1].i),
+        low=float(zone_low),
+        high=float(zone_high),
+        time0=ls[-1].time,
+        time1=ls[-1].time,
+    )
 
-    buf = max(atr * 0.35, close * 0.004)
-    has_long_setup = False
-    entry_low = entry_high = sl = tp1 = tp2 = rr = 0.0
-    poi_label = "Không có demand sống dưới giá"
+    buf = max(atr * 0.4, close * 0.006)
+    sl = min(major_low, zone_low) - buf
+    if sl >= close:
+        sl = close - buf
+    # TP luôn trên giá
+    tp1 = fib_map[0.382] if fib_map[0.382] > close * 1.01 else fib_map[0.236]
+    if tp1 <= close:
+        tp1 = max(major_high, close * 1.04)
+    tp2 = major_high if major_high > tp1 else tp1 + max(atr * 2, span * 0.25)
+    if tp2 <= tp1:
+        tp2 = tp1 * 1.04
+    entry_mid = (zone_low + zone_high) / 2
+    # entry phải không nằm trên đầu giá — nếu vùng đáy đã ở dưới, giữ nguyên để chờ hồi
+    has_long = entry_mid <= close * 1.015 and sl < min(close, zone_low)
+    if zone_high > close * 1.01:
+        # giá đang dưới cả vùng fib — không có entry hợp lệ phía trên
+        zone_high = min(zone_high, close)
+        zone_low = min(zone_low, zone_high)
+        has_long = zone_low < close and sl < zone_low
+    risk = max(entry_mid - sl, 1e-9)
+    reward = tp1 - entry_mid
+    rr = float(reward / risk) if reward > 0 else 0.0
 
-    def arm_long(z_low: float, z_high: float, label: str):
-        nonlocal entry_low, entry_high, sl, tp1, tp2, rr, has_long_setup, poi_label
-        entry_low, entry_high = float(z_low), float(z_high)
-        if entry_high < entry_low:
-            entry_low, entry_high = entry_high, entry_low
-        # Long-only: zone không được nằm trên đầu giá
-        if (entry_low + entry_high) / 2 > close * 1.01:
-            has_long_setup = False
-            return
-        sl = _long_sl(entry_low, dealing_low, close, atr)
-        mid = (entry_low + entry_high) / 2
-        tp1, tp2 = _long_targets(close, mid, liq_up, dealing_high, atr)
-        risk = mid - sl
-        reward = tp1 - mid
-        rr = float(reward / risk) if risk > 0 else 0.0
-        has_long_setup = True
-        poi_label = label
+    invalidation = sl
+    structure = {
+        "bull": "Sóng lớn đang tăng (đỉnh sau cao hơn, đáy sau cao hơn)",
+        "bear": "Sóng lớn đang giảm (đỉnh sau thấp hơn, đáy sau thấp hơn)",
+        "range": "Sóng lớn đi ngang",
+    }[bias]
 
-    if poi is not None:
-        arm_long(poi.low, poi.high, poi_names.get(poi.kind, poi.kind))
-    if not has_long_setup and bias in ("bull", "range") and pd_zone in ("DISCOUNT", "EQ"):
-        band = span * 0.04
-        arm_long(max(dealing_low, eq - band), min(eq + band * 0.3, close), "EQ / discount (chờ limit long)")
+    plain = _plain(last_event) if fresh else _plain("NONE")
+    if not fresh and last_event != "NONE":
+        plain += " Lần phá mức trước đã cũ, không dùng để vào lệnh nữa."
 
-    in_zone = has_long_setup and entry_low * 0.997 <= close <= entry_high * 1.003
-    near_zone = has_long_setup and abs(close - (entry_low + entry_high) / 2) / close <= 0.03
-
+    action: Action = "WATCH"
     tactics: list[str] = []
-    thesis_bits: list[str] = [
-        "VN long-only — không short",
-        structure,
-        f"Giá đang ở {pd_zone} ({pd_pct*100:.0f}% dealing range)",
-    ]
-    if last_event != "NONE":
-        thesis_bits.append(f"Event gần nhất: {last_event.replace('_', ' ')}")
-    if has_long_setup:
-        thesis_bits.append(f"POI long: {poi_label}")
-    else:
-        thesis_bits.append("Chưa có vùng demand hợp lệ dưới giá")
 
-    action: Action = "SKIP"
-
-    if bias == "bull":
-        if last_event == "CHOCH_DN":
-            action = "EXIT"
-            tactics += [
-                "CHoCH xuống — structure tăng đã gãy. Thị trường VN không short: chỉ thoát long.",
-                f"Nếu đang cầm: cắt quanh invalidation {invalidation:.2f} (swing low).",
-                "Không mua dip cho đến khi có CHoCH lên + demand mới.",
-            ]
-            has_long_setup = False
-        elif pd_zone == "PREMIUM":
-            action = "WATCH"
-            tactics += [
-                "Bias tăng nhưng giá đang premium — không đuổi long.",
-                "Chờ hồi về discount / bullish OB-FVG dưới giá rồi limit buy.",
-            ]
-            if has_long_setup:
-                tactics.append(
-                    f"Vùng chờ long {entry_low:.2f}–{entry_high:.2f}. SL {sl:.2f} (dưới POI). "
-                    f"TP1 {tp1:.2f} / TP2 {tp2:.2f} (trên giá)."
-                )
-        elif has_long_setup and (in_zone or (pd_zone in ("DISCOUNT", "EQ") and near_zone)):
+    if last_event == "BOS_DN" and fresh:
+        action = "EXIT"
+        has_long = False
+        tactics = [
+            "Phá đáy lớn: không mua. Đang cầm thì bán, cắt dưới đáy vừa thủng.",
+            f"Mốc cắt long: {major_low:.2f}.",
+            "Chờ đáy mới và có đảo đáy (CHoCH lên) rồi mới nghĩ đến mua.",
+        ]
+    elif last_event == "CHOCH_DN" and fresh:
+        action = "EXIT"
+        has_long = False
+        tactics = [
+            "Đảo đỉnh: chuỗi tăng gãy. Không mua mới. Đang cầm thì bán hoặc hạ mạnh tỷ trọng.",
+            f"Đáy nhịp vừa mất quanh {major_low:.2f}.",
+        ]
+    elif last_event == "CHOCH_UP" and fresh:
+        if near_low and (flow or retest) and not higher_tf_blocking and rr >= 1.5 and has_long:
             action = "BUY"
-            tactics += [
-                "Limit long trong demand (OB/FVG), không market đuổi nến xanh.",
-                f"Entry {entry_low:.2f}–{entry_high:.2f} (≤ giá {close:.2f}).",
-                f"SL {sl:.2f} dưới low POI. TP1 {tp1:.2f} / TP2 {tp2:.2f} trên giá hiện tại. R:R {rr:.1f}.",
-                "Nến đóng cửa xuyên low POI → setup fail, không gồng.",
-            ]
-        elif has_long_setup:
-            action = "WATCH"
-            tactics += [
-                "Bias tăng, chưa vào demand.",
-                f"Alert khi giá vào {entry_low:.2f}–{entry_high:.2f}. SL {sl:.2f}. TP1 {tp1:.2f} / TP2 {tp2:.2f}.",
+            tactics = [
+                "Đảo đáy + còn sát đáy + có xác nhận (dòng tiền hoặc test đáy).",
+                f"Mua trong vùng {zone_low:.2f}–{zone_high:.2f} (gần đáy nhịp, fib 61.8–100%).",
+                f"Cắt lỗ nếu đóng cửa dưới {sl:.2f}. Chốt một phần tại {tp1:.2f}, phần còn lại kỳ vọng {tp2:.2f}.",
+                f"Xác nhận: {flow_why}.",
             ]
         else:
             action = "WATCH"
-            tactics += ["Bias tăng nhưng chưa có demand dưới giá — đứng ngoài, không đuổi."]
-
-    elif bias == "bear":
-        # Long-only: bear = không mở long. Nếu đang cầm → EXIT. Không bao giờ đưa entry/SL/TP short.
-        if last_event == "CHOCH_UP":
-            action = "WATCH"
-            tactics += [
-                "CHoCH lên trong downtrend — có thể sắp lật bias. Vẫn chưa short (VN không short).",
-                "Chờ retest demand sau CHoCH rồi mới long.",
+            has_long = has_long and not higher_tf_blocking
+            why_no = []
+            if not near_low:
+                why_no.append("giá đã chạy xa đáy")
+            if not (flow or retest):
+                why_no.append("chưa có dòng tiền / chưa test đáy thành công")
+            if higher_tf_blocking:
+                why_no.append("khung tuần hoặc tháng vừa phá đáy / đảo đỉnh")
+            if rr < 1.5:
+                why_no.append("lãi/lỗ kỳ vọng chưa đủ")
+            tactics = [
+                "Có đảo đáy nhưng chưa đủ điều kiện mua: " + (", ".join(why_no) or "chờ thêm") + ".",
+                "Không mua đuổi. Chỉ mua khi giá còn trong vùng gần đáy và có dòng tiền.",
             ]
-            if has_long_setup:
-                tactics.append(
-                    f"Vùng long sau retest: {entry_low:.2f}–{entry_high:.2f}. SL {sl:.2f}. TP {tp1:.2f}/{tp2:.2f}."
-                )
+            if has_long:
+                tactics.append(f"Vùng chờ: {zone_low:.2f}–{zone_high:.2f}. Cắt lỗ {sl:.2f}. Mục tiêu {tp1:.2f} rồi {tp2:.2f}.")
+    elif last_event == "BOS_UP" and fresh:
+        # phá đỉnh — không đuổi; mua nếu đã hồi về golden
+        if in_golden and (flow or retest) and not higher_tf_blocking and rr >= 1.5 and has_long and close <= zone_high * 1.02:
+            action = "BUY"
+            tactics = [
+                "Đã phá đỉnh trước đó và nay hồi về 50–78.6% của nhịp tăng, có dòng tiền hoặc giữ đáy nhịp.",
+                f"Mua {zone_low:.2f}–{zone_high:.2f}. Cắt lỗ {sl:.2f}. Mục tiêu {tp1:.2f} / {tp2:.2f}.",
+                f"Xác nhận: {flow_why}.",
+            ]
         else:
+            action = "WATCH"
+            tactics = [
+                "Phá đỉnh: xu hướng tăng còn, nhưng không mua đuổi ở vùng giá cao.",
+                f"Chờ hồi về {fib_map[0.5]:.2f}–{fib_map[0.786]:.2f} (50–78.6%). Cắt lỗ dưới {sl:.2f}. Mục tiêu trên giá: {tp1:.2f} rồi {tp2:.2f}.",
+            ]
+            if higher_tf_blocking:
+                tactics.append("Khung tuần/tháng đang xấu — ưu tiên đứng ngoài dù ngày vừa phá đỉnh.")
+                has_long = False
+    else:
+        # Không có phá đỉnh/đáy MỚI trên ngày — không hô bán chỉ vì sóng đang giảm.
+        if higher_tf_blocking:
             action = "EXIT"
-            has_long_setup = False
-            tactics += [
-                "Bias giảm (LH/LL hoặc BOS xuống). Sàn VN chỉ long → không mở vị thế mới.",
-                f"Nếu đang cầm long: thoát / hạ tỷ trọng. Invalidation {invalidation:.2f} (dưới giá).",
-                "Không đặt entry trên giá, không lấy TP dưới giá (đó là logic short).",
+            has_long = False
+            plain = "Khung tuần hoặc tháng vừa phá đáy hoặc đảo đỉnh. Không mua. Nếu đang cầm thì bán."
+            tactics = [
+                "Tín hiệu bán nằm ở khung tuần/tháng, không phải vài phiên ngày.",
+                f"Mốc cắt tham chiếu: {major_low:.2f}.",
+                tf_label,
             ]
-            if pd_zone == "DISCOUNT":
-                tactics.append(
-                    "Giá đã discount trong downtrend: chỉ theo dõi demand, mua khi có CHoCH lên xác nhận — không bắt dao rơi."
-                )
-
-    else:  # range
-        if pd_zone == "PREMIUM":
-            action = "EXIT" if close > eq else "WATCH"
-            tactics += [
-                "Range + premium. Long-only: không mua, nếu đang cầm thì canh chốt về EQ.",
-                f"Invalidation dưới range low {dealing_low:.2f}.",
+        elif bias == "bear":
+            action = "WATCH"
+            has_long = False
+            tactics = [
+                "Sóng lớn vẫn giảm nhưng chưa thủng đáy mới. Không mua.",
+                "Chỉ bán khi có phá đáy (BOS) hoặc đảo đỉnh (CHoCH). Chưa tới thì đứng ngoài.",
             ]
-            if action == "EXIT":
-                has_long_setup = False
-        elif has_long_setup and (in_zone or pd_zone == "DISCOUNT"):
-            action = "BUY" if in_zone or near_zone else "WATCH"
-            tactics += [
-                "Range + discount — long cạnh dealing low, size nhỏ.",
-                f"Entry {entry_low:.2f}–{entry_high:.2f}. SL {sl:.2f}. TP1 EQ/liquidity {tp1:.2f} (trên giá), TP2 {tp2:.2f}.",
+        elif bias == "bull" and in_golden and (flow or retest) and rr >= 1.5 and has_long:
+            action = "WATCH"
+            tactics = [
+                "Giá gần đáy một nhịp tăng và có dòng tiền, nhưng chưa phá đỉnh/đảo đáy mới.",
+                "Chưa mua một mình — cần các chiến thuật kia cùng chiều hoặc một lần phá đỉnh rõ.",
+                f"Vùng nếu được xác nhận: {zone_low:.2f}–{zone_high:.2f}. Cắt lỗ {sl:.2f}. Mục tiêu {tp1:.2f} / {tp2:.2f}.",
+                f"Xác nhận giá: {flow_why}.",
+            ]
+        elif pd_zone == "PREMIUM" or depth < 0.45:
+            action = "WATCH"
+            tactics = [
+                "Giá đang gần đỉnh nhịp. Không mua đuổi.",
+                f"Chờ về {fib_map[0.5]:.2f}–{fib_map[0.786]:.2f} (50–78.6% từ đỉnh về đáy) mới xem lại.",
             ]
         else:
             action = "WATCH"
-            tactics += [f"Range giữa EQ {eq:.2f}. Đợi giá về discount mới long."]
+            tactics = [
+                "Đứng ngoài. Chưa phá đỉnh mới, cũng chưa có đáy được dòng tiền xác nhận.",
+                f"Vùng đáng mua nếu sau này có xác nhận: {zone_low:.2f}–{zone_high:.2f}.",
+            ]
 
-    if action == "BUY" and (not has_long_setup or rr < 1.5 or sl >= close or tp1 <= close):
+    if action == "BUY" and (not has_long or sl >= close or tp1 <= close):
         action = "WATCH"
-        tactics.append("Không đủ điều kiện long (R:R / SL-TP so với giá) — hạ WATCH.")
-        if sl >= close or (has_long_setup and tp1 <= close):
-            has_long_setup = False
+        tactics.append("Mức cắt lỗ/mục tiêu không hợp lệ so với giá hiện tại — hạ xuống chờ.")
+        has_long = False
 
-    thesis = " · ".join(thesis_bits)
+    depth_pct = depth * 100
+    thesis = " · ".join([
+        plain,
+        structure,
+        f"Giá ở {depth_pct:.0f}% từ đỉnh nhịp về đáy (0%=đỉnh, 100%=đáy)",
+        tf_label,
+        f"Dòng tiền: {flow_why}",
+    ])
+
+    poi_label = (
+        f"Vùng gần đáy nhịp (fib 61.8–100%): {zone_low:.2f}–{zone_high:.2f}"
+        if has_long else
+        "Không mở long"
+    )
     return SmcPlan(
         bias=bias,
-        last_event=last_event,
+        last_event=last_event if fresh else "NONE",
         structure=structure,
-        dealing_low=round(dealing_low, 2),
-        dealing_high=round(dealing_high, 2),
+        dealing_low=round(leg_bot, 2),
+        dealing_high=round(leg_top, 2),
         eq=round(eq, 2),
         pd=pd_zone,
-        pd_pct=round(pd_pct, 3),
-        poi=poi if has_long_setup else None,
-        poi_label=poi_label if has_long_setup else "Không mở long (bias giảm / không có demand)",
-        entry_low=round(entry_low, 2) if has_long_setup else 0.0,
-        entry_high=round(entry_high, 2) if has_long_setup else 0.0,
-        sl=round(sl, 2) if has_long_setup else round(invalidation, 2),
-        tp1=round(tp1, 2) if has_long_setup else 0.0,
-        tp2=round(tp2, 2) if has_long_setup else 0.0,
-        rr=round(rr, 2) if has_long_setup else 0.0,
+        pd_pct=round(depth, 3),
+        poi=demand if has_long else None,
+        poi_label=poi_label,
+        entry_low=round(zone_low, 2) if has_long else 0.0,
+        entry_high=round(min(zone_high, close), 2) if has_long else 0.0,
+        sl=round(sl, 2) if has_long else round(min(invalidation, close - buf), 2),
+        tp1=round(tp1, 2) if has_long else 0.0,
+        tp2=round(tp2, 2) if has_long else 0.0,
+        rr=round(rr, 2) if has_long else 0.0,
         action=action,
         thesis=thesis,
         tactics=tactics,
-        liquidity_up=liq_up,
-        liquidity_dn=liq_dn,
-        events=events[-8:],
-        zones=(obs + fvgs)[-16:],
-        swings=swings[-16:],
-        has_long_setup=has_long_setup,
-        invalidation=round(invalidation, 2),
+        liquidity_up=[round(major_high, 2), round(fib_map[0.236], 2)],
+        liquidity_dn=[round(major_low, 2), round(leg_bot, 2)],
+        events=events[-6:],
+        zones=[demand],
+        swings=swings[-12:],
+        has_long_setup=has_long,
+        invalidation=round(min(major_low, close - buf), 2),
+        plain=plain,
+        tf_label=tf_label,
+        fibs=[(r, round(p, 2)) for r, p in fibs],
     )
 
 
@@ -571,15 +600,22 @@ def plan_to_row(plan: SmcPlan) -> dict:
     else:
         entry = "—"
         sl = f"cắt long {plan.invalidation:.2f}" if plan.action == "EXIT" else "—"
-        tp1 = "—"
-        tp2 = "—"
-        rr = "—"
+        tp1 = tp2 = rr = "—"
+    ev = {
+        "BOS_UP": "Phá đỉnh",
+        "BOS_DN": "Phá đáy",
+        "CHOCH_UP": "Đảo đáy",
+        "CHOCH_DN": "Đảo đỉnh",
+        "NONE": "Chưa phá mức",
+    }.get(plan.last_event, plan.last_event)
     return {
         "S_SMC": plan.action,
         "SMC bias": plan.bias.upper(),
-        "SMC event": plan.last_event.replace("_", " "),
+        "SMC event": ev,
         "SMC PD": plan.pd,
         "SMC POI": plan.poi_label,
+        "SMC nói": plan.plain,
+        "SMC TF": plan.tf_label,
         "SMC entry": entry,
         "SMC SL": sl,
         "SMC TP1": tp1,
@@ -594,7 +630,7 @@ def plan_to_row(plan: SmcPlan) -> dict:
 def smc_plotly(df: pd.DataFrame, plan: SmcPlan, title: str = ""):
     import plotly.graph_objects as go
 
-    work = df.tail(120).reset_index(drop=True)
+    work = df.tail(220).reset_index(drop=True)
     fig = go.Figure(
         data=[
             go.Candlestick(
@@ -603,77 +639,74 @@ def smc_plotly(df: pd.DataFrame, plan: SmcPlan, title: str = ""):
                 high=work["high"],
                 low=work["low"],
                 close=work["close"],
-                name="OHLC",
+                name="Giá",
                 increasing_line_color="#3DDC97",
                 decreasing_line_color="#FF6B6B",
             )
         ]
     )
-    # swings
+    # đường sóng lớn
+    sx = [s.time for s in plan.swings if s.time in set(work["time"]) or True]
+    # thời gian có thể lệch kiểu — lọc theo vị trí nếu time khớp được
+    times = list(work["time"])
+    line_x, line_y = [], []
     for s in plan.swings:
-        if s.i < len(df) - 120:
-            continue
+        if s.time in times or str(s.time) in {str(t) for t in times}:
+            line_x.append(s.time)
+            line_y.append(s.price)
+    if len(line_x) >= 2:
         fig.add_trace(
             go.Scatter(
-                x=[s.time],
-                y=[s.price],
-                mode="markers+text",
-                text=["H" if s.kind == "H" else "L"],
-                textposition="top center" if s.kind == "H" else "bottom center",
-                marker=dict(size=9, color="#F5C451" if s.kind == "H" else "#60A5FA"),
-                showlegend=False,
-                hoverinfo="skip",
+                x=line_x, y=line_y, mode="lines+markers",
+                line=dict(color="#60A5FA", width=2),
+                marker=dict(size=7, color="#60A5FA"),
+                name="Sóng lớn",
+                hovertext=["Đỉnh lớn" if s.kind == "H" else "Đáy lớn" for s in plan.swings if s.time in line_x or True][:len(line_x)],
             )
         )
-    # events
-    for e in plan.events:
-        fig.add_vline(
-            x=e.time,
-            line_dash="dot",
-            line_color="#A78BFA" if "CHOCH" in e.kind else "#94A3B8",
-            annotation_text=e.kind.replace("_", " "),
-            annotation_font_size=10,
-        )
-    # zones
-    t0, t1 = work["time"].iloc[0], work["time"].iloc[-1]
-    recent_i0 = max(0, len(work) - 90)
-    for z in [zz for zz in plan.zones if zz.i1 >= recent_i0][-6:]:
-        color = "rgba(61,220,151,0.18)" if "BULL" in z.kind else "rgba(255,107,107,0.18)"
-        fig.add_hrect(
-            y0=z.low,
-            y1=z.high,
-            line_width=0,
-            fillcolor=color,
-            annotation_text=z.kind.replace("_", " "),
-            annotation_font_size=9,
-        )
-    fig.add_hline(y=plan.eq, line_dash="dash", line_color="#F5C451", annotation_text="EQ")
-    if plan.has_long_setup:
-        fig.add_hline(y=plan.sl, line_color="#FF6B6B", annotation_text="SL long")
-        fig.add_hline(y=plan.tp1, line_color="#3DDC97", annotation_text="TP1")
-        fig.add_hline(y=plan.tp2, line_dash="dash", line_color="#3DDC97", annotation_text="TP2")
-        fig.add_hrect(
-            y0=plan.entry_low,
-            y1=plan.entry_high,
-            line_width=1,
-            line_color="#3DDC97",
-            fillcolor="rgba(61,220,151,0.08)",
-            annotation_text="ENTRY LONG",
-        )
-    else:
+    for r, price in plan.fibs:
         fig.add_hline(
-            y=plan.invalidation,
-            line_color="#FF6B6B",
-            annotation_text="cắt long / invalidation",
+            y=price,
+            line_color="#334155" if r not in (0.5, 0.618, 0.786) else "#14532d",
+            line_dash="dot",
+            annotation_text=f"{r:.3g} ({price:.2f})",
+            annotation_font_size=10,
+            annotation_font_color="#94A3B8",
         )
+    if plan.zones:
+        z = plan.zones[-1]
+        fig.add_hrect(
+            y0=z.low, y1=z.high,
+            fillcolor="rgba(61,220,151,0.16)",
+            line_width=0,
+            annotation_text="vùng gần đáy",
+            annotation_font_size=11,
+        )
+    if plan.events:
+        e = plan.events[-1]
+        fig.add_vline(
+            x=e.time, line_dash="dash", line_color="#A78BFA",
+            annotation_text={
+                "BOS_UP": "Phá đỉnh",
+                "BOS_DN": "Phá đáy",
+                "CHOCH_UP": "Đảo đáy",
+                "CHOCH_DN": "Đảo đỉnh",
+            }.get(e.kind, e.kind),
+        )
+    if plan.has_long_setup:
+        fig.add_hline(y=plan.sl, line_color="#FF6B6B", annotation_text="Cắt lỗ")
+        fig.add_hline(y=plan.tp1, line_color="#3DDC97", annotation_text="Chốt 1")
+        fig.add_hline(y=plan.tp2, line_dash="dash", line_color="#3DDC97", annotation_text="Chốt 2")
+    else:
+        fig.add_hline(y=plan.invalidation, line_color="#FF6B6B", annotation_text="Cắt long")
     fig.update_layout(
-        title=title or "SMC",
+        title=title or "SMC khung lớn",
         template="plotly_dark",
         paper_bgcolor="#0B1220",
         plot_bgcolor="#0E1624",
-        height=520,
+        height=680,
         xaxis_rangeslider_visible=False,
-        margin=dict(l=16, r=16, t=48, b=16),
+        margin=dict(l=12, r=12, t=48, b=12),
         font=dict(family="IBM Plex Sans, sans-serif", color="#E8EDF5"),
         showlegend=False,
     )
