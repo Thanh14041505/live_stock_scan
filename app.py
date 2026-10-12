@@ -17,7 +17,7 @@ from vn_quant.engine import (
     register_api_key,
     scan_universe,
 )
-from vn_quant.smc import analyze_smc, smc_plotly
+from vn_quant.smc import analyze_smc, chart_view, trade_figure
 
 st.set_page_config(
     page_title="VN Quant Desk",
@@ -287,6 +287,78 @@ if errs:
     with st.expander(f"Mã lỗi / thiếu data ({len(errs)})"):
         st.dataframe(pd.DataFrame(errs), hide_index=True, width="stretch")
 
+def _fmt_vol(v) -> str:
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        return "—"
+    if v >= 1_000_000:
+        return f"{v / 1_000_000:.2f}M"
+    if v >= 1_000:
+        return f"{v / 1_000:.0f}K"
+    return f"{v:.0f}"
+
+
+def render_symbol_chart(symbol: str, ohlc: pd.DataFrame, row, scope: str):
+    st.caption(
+        "Nến tuần/tháng được gộp từ nến ngày. EMA tính trên khung đang xem. "
+        "Tín hiệu quét vẫn dựa trên nến ngày."
+    )
+    c1, c2 = st.columns([1.5, 1])
+    with c1:
+        window = st.segmented_control(
+            "Khung",
+            ["1D", "1W", "1M", "3M", "6M", "1Y", "ALL"],
+            default="6M",
+            key=f"win_{scope}",
+            label_visibility="collapsed",
+        ) or "6M"
+    with c2:
+        layers = st.pills(
+            "Lớp",
+            ["EMA20", "EMA50", "Volume"],
+            selection_mode="multi",
+            default=["EMA20", "EMA50", "Volume"],
+            key=f"layers_{scope}",
+            label_visibility="collapsed",
+        )
+        layers = list(layers or [])
+    hint = row.to_dict() if row is not None else None
+    plan = analyze_smc(ohlc, flow_hint=hint)
+    view = chart_view(ohlc, window)
+    if view is None or view.empty:
+        st.warning("Không đủ nến để vẽ.")
+        return plan
+    last = view.iloc[-1]
+    when = pd.to_datetime(last["time"]).strftime("%Y-%m-%d")
+    close_px = float(last["close"])
+    d1, d2, d3, d4, d5 = st.columns(5)
+    d1.metric("DATE", when)
+    d2.metric("OPEN", f"{float(last['open']):.2f}")
+    d3.metric("HIGH / LOW", f"{float(last['high']):.2f} / {float(last['low']):.2f}")
+    d4.metric("CLOSE", f"{close_px:.2f}")
+    d5.metric("VOLUME", _fmt_vol(last.get("volume", 0)))
+    fig = trade_figure(
+        ohlc,
+        plan=plan,
+        levels=hint,
+        window=window,
+        show_ema20="EMA20" in layers,
+        show_ema50="EMA50" in layers,
+        show_volume="Volume" in layers,
+        show_levels=True,
+        show_smc=True,
+        title=symbol,
+    )
+    st.plotly_chart(fig, width="stretch")
+    st.caption(
+        f"{len(view)} nến. Xanh = đóng cửa ≥ mở · Đỏ = đóng cửa < mở. "
+        "Đường tím: đỉnh 20 phiên. Chấm xanh: entry. Đỏ: cắt lỗ. Xanh lá: chốt lời. "
+        "Đường trắng: đỉnh/đáy SMC. Vạch fib: 0 là đỉnh nhịp, 1 là đáy nhịp."
+    )
+    return plan
+
+
 tab_c, tab_b, tab_w, tab_e, tab_all, tab_x, tab_smc, tab_d = st.tabs(
     ["Consensus", "BUY", "WATCH", "EXIT", "Toàn bộ", "Conflict", "SMC + Chart", "Chi tiết 1 mã"]
 )
@@ -337,7 +409,9 @@ with tab_smc:
         if ohlc is None:
             st.warning("Không lấy được nến để vẽ SMC.")
         else:
-            plan = analyze_smc(ohlc)
+            hit = work[work["Mã"].astype(str) == str(pick_smc)]
+            row_smc = hit.iloc[0] if not hit.empty else None
+            plan = render_symbol_chart(pick_smc, ohlc, row_smc, "smc")
             if plan is None:
                 st.warning("Không đủ nến để đọc structure.")
             else:
@@ -347,7 +421,6 @@ with tab_smc:
                 m3.metric("PD", f"{plan.pd} ({plan.pd_pct:.0%})")
                 m4.metric("Entry", f"{plan.entry_low:.2f}–{plan.entry_high:.2f}" if plan.has_long_setup else "không long")
                 m5.metric("R:R", f"1:{plan.rr:.1f}" if plan.has_long_setup else "—")
-                st.plotly_chart(smc_plotly(ohlc, plan, title=f"{pick_smc} · {plan.structure}"), width="stretch")
                 left, right = st.columns(2)
                 with left:
                     st.markdown("**Nên làm gì**")
@@ -386,6 +459,13 @@ with tab_d:
         b.metric("Score", row.get("Score", "—"))
         c.metric("Win%", row.get("Win%", "—"))
         d.metric("Consensus", row.get("consensus", "—"))
+        dl = st.session_state.get("data_layer")
+        lb = int(st.session_state.get("lookback_long") or 400)
+        ohlc = dl.fetch(str(pick), lb) if dl is not None else None
+        if ohlc is None:
+            st.warning("Không lấy được nến để vẽ.")
+        else:
+            render_symbol_chart(str(pick), ohlc, row, "detail")
         st.markdown(
             f"""
 **Tín hiệu:** {row.get('Tín hiệu','—')}  
