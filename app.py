@@ -350,7 +350,7 @@ def render_symbol_chart(symbol: str, ohlc: pd.DataFrame, row, scope: str):
         show_smc=True,
         title=symbol,
     )
-    st.plotly_chart(fig, width="stretch")
+    st.plotly_chart(fig, width="stretch", key=f"chart_{scope}")
     st.caption(
         f"{len(view)} nến. Xanh = đóng cửa ≥ mở · Đỏ = đóng cửa < mở. "
         "Đường tím: đỉnh 20 phiên. Chấm xanh: entry. Đỏ: cắt lỗ. Xanh lá: chốt lời. "
